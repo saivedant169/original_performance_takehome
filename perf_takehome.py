@@ -295,7 +295,7 @@ class KernelBuilder:
             self._scalar_cache[v] = self._scratch_ptr - 1
 
         # ---- vector constants ----
-        for v in [1, 2, 3, 4, 7]:
+        for v in [2]:
             self._alloc_vec(tag=f"vc_{v}")
             self._vec_cache[v] = self._scratch_ptr - VLEN
 
@@ -427,16 +427,16 @@ class KernelBuilder:
 
         # ---- 2d: load input indices and values ----
         for blk in range(n_blocks):
+            ops.append(("alu",  ("+",     tmp0, p_values,  off_reg)))
+            ops.append(("load", ("vload", val_base + blk * VLEN, tmp0)))
             ops.append(("alu",  ("+",     tmp0, p_indices, off_reg)))
             ops.append(("load", ("vload", idx_base + blk * VLEN, tmp0)))
+            ops.append(("alu",  ("+",     off_reg, off_reg, sc[8])))
             for lane in range(VLEN):
                 ops.append(
                     ("alu", ("+", idx_base + blk * VLEN + lane,
                              idx_base + blk * VLEN + lane, sc[1]))
                 )
-            ops.append(("alu",  ("+",     tmp0, p_values,  off_reg)))
-            ops.append(("load", ("vload", val_base + blk * VLEN, tmp0)))
-            ops.append(("alu",  ("+",     off_reg, off_reg, sc[8])))
 
         # ---- 2e: tiled main loop ----
         for grp_start in range(0, n_blocks, tile_w):

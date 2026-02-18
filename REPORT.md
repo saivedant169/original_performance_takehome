@@ -23,8 +23,8 @@ python3 tests/submission_tests.py
 Observed result:
 
 - Tests: `Ran 9 tests ... OK`
-- Cycle count: `1184`
-- Reported speedup: `124.77533783783784x` over the baseline constant used by
+- Cycle count: `1183`
+- Reported speedup: `124.88081149619612x` over the baseline constant used by
   the test suite (`BASELINE = 147734`)
 
 Integrity check:
@@ -120,6 +120,14 @@ tiles:
 Each tile slot gets dedicated temporary vectors (`node`, `t0..t3`) to maintain
 parallel independent chains for scheduling.
 
+### G. Latest safe refinement
+
+- In the phase-`2d` preload loop, value vectors are loaded before index vectors.
+- The `off_reg` increment is moved before the lane-wise index `+1` fixups.
+- Unused vector constants (`vc_1`, `vc_3`, `vc_4`, `vc_7`) are removed.
+
+This combination produced the additional safe drop from `1184` to `1183`.
+
 ## 5. Correctness and Validation
 
 Correctness is enforced in `tests/submission_tests.py` by comparing kernel output
@@ -139,9 +147,9 @@ generality.
 
 Recent exploration note:
 
-- Additional schedule and micro-op experiments were run after reaching `1184`,
-  but none improved on `1184` without correctness loss or regression. Current
-  stable best in this workspace remains `1184`.
+- Additional schedule and micro-op experiments were run after reaching `1183`,
+  but none improved on `1183` without correctness loss or regression. Current
+  stable best in this workspace remains `1183`.
 
 ## 7. Reproducible Commands
 
@@ -153,4 +161,4 @@ git diff origin/main tests/
 python3 tests/submission_tests.py
 ```
 
-Expected current cycle result in this workspace: **1184**.
+Expected current cycle result in this workspace: **1183**.

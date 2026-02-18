@@ -219,120 +219,127 @@ class Machine:
     def alu(self, core, op, dest, a1, a2):
         a1 = core.scratch[a1]
         a2 = core.scratch[a2]
-        match op:
-            case "+":
-                res = a1 + a2
-            case "-":
-                res = a1 - a2
-            case "*":
-                res = a1 * a2
-            case "//":
-                res = a1 // a2
-            case "cdiv":
-                res = cdiv(a1, a2)
-            case "^":
-                res = a1 ^ a2
-            case "&":
-                res = a1 & a2
-            case "|":
-                res = a1 | a2
-            case "<<":
-                res = a1 << a2
-            case ">>":
-                res = a1 >> a2
-            case "%":
-                res = a1 % a2
-            case "<":
-                res = int(a1 < a2)
-            case "==":
-                res = int(a1 == a2)
-            case _:
-                raise NotImplementedError(f"Unknown alu op {op}")
+        if op == "+":
+            res = a1 + a2
+        elif op == "-":
+            res = a1 - a2
+        elif op == "*":
+            res = a1 * a2
+        elif op == "//":
+            res = a1 // a2
+        elif op == "cdiv":
+            res = cdiv(a1, a2)
+        elif op == "^":
+            res = a1 ^ a2
+        elif op == "&":
+            res = a1 & a2
+        elif op == "|":
+            res = a1 | a2
+        elif op == "<<":
+            res = a1 << a2
+        elif op == ">>":
+            res = a1 >> a2
+        elif op == "%":
+            res = a1 % a2
+        elif op == "<":
+            res = int(a1 < a2)
+        elif op == "==":
+            res = int(a1 == a2)
+        else:
+            raise NotImplementedError(f"Unknown alu op {op}")
         res = res % (2**32)
         self.scratch_write[dest] = res
 
     def valu(self, core, *slot):
-        match slot:
-            case ("vbroadcast", dest, src):
-                for i in range(VLEN):
-                    self.scratch_write[dest + i] = core.scratch[src]
-            case ("multiply_add", dest, a, b, c):
-                for i in range(VLEN):
-                    mul = (core.scratch[a + i] * core.scratch[b + i]) % (2**32)
-                    self.scratch_write[dest + i] = (mul + core.scratch[c + i]) % (2**32)
-            case (op, dest, a1, a2):
-                for i in range(VLEN):
-                    self.alu(core, op, dest + i, a1 + i, a2 + i)
-            case _:
-                raise NotImplementedError(f"Unknown valu op {slot}")
+        if len(slot) == 3 and slot[0] == "vbroadcast":
+            _, dest, src = slot
+            for i in range(VLEN):
+                self.scratch_write[dest + i] = core.scratch[src]
+        elif len(slot) == 5 and slot[0] == "multiply_add":
+            _, dest, a, b, c = slot
+            for i in range(VLEN):
+                mul = (core.scratch[a + i] * core.scratch[b + i]) % (2**32)
+                self.scratch_write[dest + i] = (mul + core.scratch[c + i]) % (2**32)
+        elif len(slot) == 4:
+            op, dest, a1, a2 = slot
+            for i in range(VLEN):
+                self.alu(core, op, dest + i, a1 + i, a2 + i)
+        else:
+            raise NotImplementedError(f"Unknown valu op {slot}")
 
     def load(self, core, *slot):
-        match slot:
-            case ("load", dest, addr):
-                # print(dest, addr, core.scratch[addr])
-                self.scratch_write[dest] = self.mem[core.scratch[addr]]
-            case ("load_offset", dest, addr, offset):
-                # Handy for treating vector dest and addr as a full block in the mini-compiler if you want
-                self.scratch_write[dest + offset] = self.mem[
-                    core.scratch[addr + offset]
-                ]
-            case ("vload", dest, addr):  # addr is a scalar
-                addr = core.scratch[addr]
-                for vi in range(VLEN):
-                    self.scratch_write[dest + vi] = self.mem[addr + vi]
-            case ("const", dest, val):
-                self.scratch_write[dest] = (val) % (2**32)
-            case _:
-                raise NotImplementedError(f"Unknown load op {slot}")
+        if slot[0] == "load":
+            _, dest, addr = slot
+            self.scratch_write[dest] = self.mem[core.scratch[addr]]
+        elif slot[0] == "load_offset":
+            _, dest, addr, offset = slot
+            self.scratch_write[dest + offset] = self.mem[
+                core.scratch[addr + offset]
+            ]
+        elif slot[0] == "vload":
+            _, dest, addr = slot
+            addr = core.scratch[addr]
+            for vi in range(VLEN):
+                self.scratch_write[dest + vi] = self.mem[addr + vi]
+        elif slot[0] == "const":
+            _, dest, val = slot
+            self.scratch_write[dest] = (val) % (2**32)
+        else:
+            raise NotImplementedError(f"Unknown load op {slot}")
 
     def store(self, core, *slot):
-        match slot:
-            case ("store", addr, src):
-                addr = core.scratch[addr]
-                self.mem_write[addr] = core.scratch[src]
-            case ("vstore", addr, src):  # addr is a scalar
-                addr = core.scratch[addr]
-                for vi in range(VLEN):
-                    self.mem_write[addr + vi] = core.scratch[src + vi]
-            case _:
-                raise NotImplementedError(f"Unknown store op {slot}")
+        if slot[0] == "store":
+            _, addr, src = slot
+            addr = core.scratch[addr]
+            self.mem_write[addr] = core.scratch[src]
+        elif slot[0] == "vstore":
+            _, addr, src = slot
+            addr = core.scratch[addr]
+            for vi in range(VLEN):
+                self.mem_write[addr + vi] = core.scratch[src + vi]
+        else:
+            raise NotImplementedError(f"Unknown store op {slot}")
 
     def flow(self, core, *slot):
-        match slot:
-            case ("select", dest, cond, a, b):
-                self.scratch_write[dest] = (
-                    core.scratch[a] if core.scratch[cond] != 0 else core.scratch[b]
+        if slot[0] == "select":
+            _, dest, cond, a, b = slot
+            self.scratch_write[dest] = (
+                core.scratch[a] if core.scratch[cond] != 0 else core.scratch[b]
+            )
+        elif slot[0] == "add_imm":
+            _, dest, a, imm = slot
+            self.scratch_write[dest] = (core.scratch[a] + imm) % (2**32)
+        elif slot[0] == "vselect":
+            _, dest, cond, a, b = slot
+            for vi in range(VLEN):
+                self.scratch_write[dest + vi] = (
+                    core.scratch[a + vi]
+                    if core.scratch[cond + vi] != 0
+                    else core.scratch[b + vi]
                 )
-            case ("add_imm", dest, a, imm):
-                self.scratch_write[dest] = (core.scratch[a] + imm) % (2**32)
-            case ("vselect", dest, cond, a, b):
-                for vi in range(VLEN):
-                    self.scratch_write[dest + vi] = (
-                        core.scratch[a + vi]
-                        if core.scratch[cond + vi] != 0
-                        else core.scratch[b + vi]
-                    )
-            case ("halt",):
-                core.state = CoreState.STOPPED
-            case ("pause",):
-                if self.enable_pause:
-                    core.state = CoreState.PAUSED
-            case ("trace_write", val):
-                core.trace_buf.append(core.scratch[val])
-            case ("cond_jump", cond, addr):
-                if core.scratch[cond] != 0:
-                    core.pc = addr
-            case ("cond_jump_rel", cond, offset):
-                if core.scratch[cond] != 0:
-                    core.pc += offset
-            case ("jump", addr):
+        elif slot[0] == "halt":
+            core.state = CoreState.STOPPED
+        elif slot[0] == "pause":
+            if self.enable_pause:
+                core.state = CoreState.PAUSED
+        elif slot[0] == "trace_write":
+            core.trace_buf.append(core.scratch[slot[1]])
+        elif slot[0] == "cond_jump":
+            _, cond, addr = slot
+            if core.scratch[cond] != 0:
                 core.pc = addr
-            case ("jump_indirect", addr):
-                core.pc = core.scratch[addr]
-            case ("coreid", dest):
-                self.scratch_write[dest] = core.id
-            case _:
-                raise NotImplementedError(f"Unknown flow op {slot}")
+        elif slot[0] == "cond_jump_rel":
+            _, cond, offset = slot
+            if core.scratch[cond] != 0:
+                core.pc += offset
+        elif slot[0] == "jump":
+            core.pc = slot[1]
+        elif slot[0] == "jump_indirect":
+            core.pc = core.scratch[slot[1]]
+        elif slot[0] == "coreid":
+            self.scratch_write[slot[1]] = core.id
+        else:
+            raise NotImplementedError(f"Unknown flow op {slot}")
 
     def trace_post_step(self, instr, core):
         # You can add extra stuff to the trace if you want!

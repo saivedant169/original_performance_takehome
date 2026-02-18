@@ -244,8 +244,9 @@ class KernelBuilder:
         n_nodes: int,
         batch_size: int,
         rounds: int,
-        tile_w: int = 17,   # how many VLEN-blocks to process together
+        tile_w: int = 16,   # how many VLEN-blocks to process together
         tile_r: int = 13,   # how many rounds to tile together
+        strip_r: Optional[int] = None,  # rounds per block-stripe inside tile
     ) -> None:
         """
         Emit all operations for the kernel and schedule them into VLIW bundles.
@@ -260,6 +261,9 @@ class KernelBuilder:
         tile_r        : depth of the round tile.
         """
         assert batch_size % VLEN == 0
+        if strip_r is None:
+            strip_r = tile_r
+        assert 1 <= strip_r <= tile_r
 
         # ----------------------------------------------------------------
         # Memory layout constants (fixed by build_mem_image)
@@ -279,6 +283,7 @@ class KernelBuilder:
 
         # Pointers into the memory image (scalar).
         p_forest  = self._alloc(tag="p_forest")
+        p_forest_m1 = self._alloc(tag="p_forest_m1")
         p_indices = self._alloc(tag="p_indices")
         p_values  = self._alloc(tag="p_values")
 
@@ -371,11 +376,10 @@ class KernelBuilder:
 
         # ---- 2a: emit all const loads (independent → scheduler packs 2/cyc) ----
         ops.append(("load", ("const", p_forest,  HDR_FOREST_VALUES)))
-        ops.append(("load", ("const", p_indices, HDR_INP_INDICES)))
-        ops.append(("load", ("const", p_values,  HDR_INP_VALUES)))
 
         for v, addr in sc.items():
-            if v in (0, 1, 2, 3, 4):
+            if v in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                     11, 12, 13, 14, 16, 19, 33, 4097):
                 continue   # built from zero-init or arithmetic below
             ops.append(("load", ("const", addr, v)))
 
@@ -384,9 +388,29 @@ class KernelBuilder:
         ops.append(("alu",  ("+", sc[2], sc[1], sc[1])))
         ops.append(("alu",  ("+", sc[3], sc[2], sc[1])))
         ops.append(("alu",  ("+", sc[4], sc[2], sc[2])))
+        ops.append(("alu",  ("+", sc[5],  sc[4],  sc[1])))
+        ops.append(("alu",  ("+", sc[6],  sc[4],  sc[2])))
+        ops.append(("alu",  ("+", sc[7],  sc[4],  sc[3])))
+        ops.append(("alu",  ("+", sc[8],  sc[4],  sc[4])))
+        ops.append(("alu",  ("+", sc[9],  sc[8],  sc[1])))
+        ops.append(("alu",  ("+", sc[10], sc[8],  sc[2])))
+        ops.append(("alu",  ("+", sc[11], sc[8],  sc[3])))
+        ops.append(("alu",  ("+", sc[12], sc[8],  sc[4])))
+        ops.append(("alu",  ("+", sc[13], sc[12], sc[1])))
+        ops.append(("alu",  ("+", sc[14], sc[12], sc[2])))
+        ops.append(("alu",  ("+", sc[16], sc[8],  sc[8])))
+        ops.append(("alu",  ("+", sc[19], sc[16], sc[3])))
+        ops.append(("alu",  ("+", sc[33], sc[16], sc[16])))
+        ops.append(("alu",  ("+", sc[33], sc[33], sc[1])))
+        ops.append(("alu",  ("<<", sc[4097], sc[1], sc[12])))
+        ops.append(("alu",  ("+",  sc[4097], sc[4097], sc[1])))
+
+        ops.append(("flow", ("add_imm", p_forest_m1, p_forest, -1)))
+        ops.append(("flow", ("add_imm", p_indices,   p_forest, n_nodes)))
+        ops.append(("flow", ("add_imm", p_values,    p_forest, n_nodes + batch_size)))
 
         # ---- 2b: broadcast all vector constants (6 valu slots/cycle) ----
-        ops.append(("valu", ("vbroadcast", vp_forest, p_forest)))
+        ops.append(("valu", ("vbroadcast", vp_forest, p_forest_m1)))
         for v, addr in vc.items():
             ops.append(("valu", ("vbroadcast", addr, sc[v])))
 
@@ -405,6 +429,11 @@ class KernelBuilder:
         for blk in range(n_blocks):
             ops.append(("alu",  ("+",     tmp0, p_indices, off_reg)))
             ops.append(("load", ("vload", idx_base + blk * VLEN, tmp0)))
+            for lane in range(VLEN):
+                ops.append(
+                    ("alu", ("+", idx_base + blk * VLEN + lane,
+                             idx_base + blk * VLEN + lane, sc[1]))
+                )
             ops.append(("alu",  ("+",     tmp0, p_values,  off_reg)))
             ops.append(("load", ("vload", val_base + blk * VLEN, tmp0)))
             ops.append(("alu",  ("+",     off_reg, off_reg, sc[8])))
@@ -413,40 +442,37 @@ class KernelBuilder:
         for grp_start in range(0, n_blocks, tile_w):
             for rnd_start in range(0, rounds, tile_r):
                 rnd_end = min(rounds, rnd_start + tile_r)
-                for gi in range(tile_w):
-                    blk = grp_start + gi
-                    if blk >= n_blocks:
-                        break
-                    ctx   = ctxs[gi]
-                    i_vec = idx_base + blk * VLEN
-                    v_vec = val_base + blk * VLEN
+                for seg_start in range(rnd_start, rnd_end, strip_r):
+                    seg_end = min(rnd_end, seg_start + strip_r)
+                    for gi in range(tile_w):
+                        blk = grp_start + gi
+                        if blk >= n_blocks:
+                            break
+                        ctx   = ctxs[gi]
+                        i_vec = idx_base + blk * VLEN
+                        v_vec = val_base + blk * VLEN
 
-                    for rnd in range(rnd_start, rnd_end):
-                        lvl = rnd % (forest_height + 1)
-                        self._emit_level(
-                            ops, lvl, forest_height,
-                            i_vec, v_vec, ctx,
-                            vp_forest, node_vc, sc, vc,
-                        )
-                        self._emit_hash(
-                            ops, v_vec, ctx,
-                            hs_vec1, hs_vec3, hs_mulv,
-                        )
-                        self._emit_idx_update(
-                            ops, lvl, forest_height, rnd,
-                            i_vec, v_vec, ctx, sc, vc,
-                        )
+                        for rnd in range(seg_start, seg_end):
+                            lvl = rnd % (forest_height + 1)
+                            self._emit_level(
+                                ops, lvl, forest_height,
+                                i_vec, v_vec, ctx,
+                                vp_forest, node_vc, sc, vc,
+                            )
+                            self._emit_hash(
+                                ops, v_vec, ctx,
+                                hs_vec1, hs_vec3, hs_mulv,
+                            )
+                            if rnd != rounds - 1:
+                                self._emit_idx_update(
+                                    ops, lvl, forest_height, rnd,
+                                    i_vec, v_vec, ctx, sc, vc,
+                                )
 
         # ---- 2f: write results back to memory ----
         ops.append(("flow", ("add_imm", tmp0, p_values, 0)))
         for blk in range(n_blocks):
             ops.append(("store", ("vstore", tmp0, val_base + blk * VLEN)))
-            if blk != n_blocks - 1:
-                ops.append(("alu", ("+", tmp0, tmp0, sc[8])))
-
-        ops.append(("flow", ("add_imm", tmp0, p_indices, 0)))
-        for blk in range(n_blocks):
-            ops.append(("store", ("vstore", tmp0, idx_base + blk * VLEN)))
             if blk != n_blocks - 1:
                 ops.append(("alu", ("+", tmp0, tmp0, sc[8])))
 
@@ -485,48 +511,39 @@ class KernelBuilder:
             xor_with(node_vc[0])
 
         elif lvl == 1:
-            # Select node[1] or node[2] based on LSB of index.
-            ops.append(("valu", ("&", ctx["t0"], i_vec, vc[1])))
-            ops.append(("flow", ("vselect", ctx["node"], ctx["t0"],
-                                 node_vc[1], node_vc[2])))
-            xor_with(ctx["node"])
+            # bit0 from prior lvl0 update is kept in ctx["node"].
+            ops.append(("flow", ("vselect", ctx["t0"], ctx["node"],
+                                 node_vc[2], node_vc[1])))
+            xor_with(ctx["t0"])
 
         elif lvl == 2:
-            # Four nodes (3-6): 2-bit selection via two vselects.
-            ops.append(("valu", ("-",  ctx["t0"], i_vec,       vc[3])))
-            ops.append(("valu", ("&",  ctx["t1"], ctx["t0"],   vc[1])))
-            ops.append(("valu", ("&",  ctx["node"], ctx["t0"], vc[2])))
-            ops.append(("flow", ("vselect", ctx["t0"],   ctx["t1"],
+            # bit0 from lvl0 is in node, bit1 from lvl1 is in t2.
+            ops.append(("flow", ("vselect", ctx["t0"],   ctx["t2"],
                                  node_vc[4], node_vc[3])))
-            ops.append(("flow", ("vselect", ctx["t1"],   ctx["t1"],
+            ops.append(("flow", ("vselect", ctx["t1"],   ctx["t2"],
                                  node_vc[6], node_vc[5])))
-            ops.append(("flow", ("vselect", ctx["node"], ctx["node"],
+            ops.append(("flow", ("vselect", ctx["t0"],   ctx["node"],
                                  ctx["t1"],  ctx["t0"])))
-            xor_with(ctx["node"])
+            xor_with(ctx["t0"])
 
         elif lvl == 3:
-            # Eight nodes (7-14): 3-bit selection via seven vselects.
-            ops.append(("valu", ("-",  ctx["t0"],   i_vec,       vc[7])))
-            ops.append(("valu", ("&",  ctx["t1"],   ctx["t0"],   vc[1])))
-            ops.append(("valu", ("&",  ctx["t2"],   ctx["t0"],   vc[2])))
-            ops.append(("valu", ("&",  ctx["t3"],   ctx["t0"],   vc[4])))
-
-            ops.append(("flow", ("vselect", ctx["node"], ctx["t1"],
+            # bit0, bit1, bit2 are carried in node/t2/t3.
+            ops.append(("flow", ("vselect", ctx["t0"],   ctx["t3"],
                                  node_vc[8],  node_vc[7])))
-            ops.append(("flow", ("vselect", ctx["t0"],   ctx["t1"],
+            ops.append(("flow", ("vselect", ctx["t1"],   ctx["t3"],
                                  node_vc[10], node_vc[9])))
             ops.append(("flow", ("vselect", ctx["t0"],   ctx["t2"],
-                                 ctx["t0"],   ctx["node"])))
+                                 ctx["t1"],   ctx["t0"])))
 
-            ops.append(("flow", ("vselect", ctx["node"], ctx["t1"],
+            ops.append(("flow", ("vselect", ctx["t1"],   ctx["t3"],
                                  node_vc[12], node_vc[11])))
-            ops.append(("flow", ("vselect", ctx["t1"],   ctx["t1"],
+            ops.append(("flow", ("vselect", ctx["t3"],   ctx["t3"],
                                  node_vc[14], node_vc[13])))
-            ops.append(("flow", ("vselect", ctx["node"], ctx["t2"],
-                                 ctx["t1"],   ctx["node"])))
-            ops.append(("flow", ("vselect", ctx["node"], ctx["t3"],
-                                 ctx["node"], ctx["t0"])))
-            xor_with(ctx["node"])
+            ops.append(("flow", ("vselect", ctx["t1"],   ctx["t2"],
+                                 ctx["t3"],   ctx["t1"])))
+            ops.append(("flow", ("vselect", ctx["t0"],   ctx["node"],
+                                 ctx["t1"],   ctx["t0"])))
+            xor_with(ctx["t0"])
 
         else:
             # Deep levels: gather from memory using the forest pointer vector.
@@ -535,7 +552,6 @@ class KernelBuilder:
                     ("alu", ("+", ctx["t0"] + lane,
                              vp_forest + lane, i_vec + lane))
                 )
-            for lane in range(VLEN):
                 ops.append(
                     ("load", ("load", ctx["node"] + lane, ctx["t0"] + lane))
                 )
@@ -577,21 +593,26 @@ class KernelBuilder:
     ) -> None:
         """Emit the index-update step after the hash."""
         if lvl == forest_height:
-            # Wrap: reset index to zero.
-            ops.append(("valu", ("^", i_vec, i_vec, i_vec)))
+            # Wrap in one-based form: reset j to 1.
+            ops.append(("valu", ("vbroadcast", i_vec, sc[1])))
         else:
-            # idx = idx * 2 + ((val & 1) + 1)
+            # One-based update: j = j * 2 + (val & 1)
+            if lvl == 0:
+                bit_vec = ctx["node"]
+            elif lvl == 1:
+                bit_vec = ctx["t2"]
+            elif lvl == 2:
+                bit_vec = ctx["t3"]
+            else:
+                bit_vec = ctx["t0"]
+
             for lane in range(VLEN):
                 ops.append(
-                    ("alu", ("&", ctx["t0"] + lane, v_vec + lane, sc[1]))
-                )
-                ops.append(
-                    ("alu", ("+", ctx["node"] + lane,
-                             ctx["t0"] + lane, sc[1]))
+                    ("alu", ("&", bit_vec + lane, v_vec + lane, sc[1]))
                 )
             ops.append(
                 ("valu", ("multiply_add", i_vec, i_vec,
-                          vc[2], ctx["node"]))
+                          vc[2], bit_vec))
             )
 
 

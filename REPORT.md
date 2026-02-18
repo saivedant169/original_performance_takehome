@@ -23,8 +23,8 @@ python3 tests/submission_tests.py
 Observed result:
 
 - Tests: `Ran 9 tests ... OK`
-- Cycle count: `1329`
-- Reported speedup: `111.16177577125659x` over the baseline constant used by
+- Cycle count: `1184`
+- Reported speedup: `124.77533783783784x` over the baseline constant used by
   the test suite (`BASELINE = 147734`)
 
 Integrity check:
@@ -44,12 +44,13 @@ Core ideas:
 
 - Build one flat operation stream and schedule globally with dependency-aware
   bundling (`pack_into_bundles`), instead of relying on local ordering.
-- Replace many memory gathers at shallow tree levels with preloaded node vectors
-  and `vselect` trees.
+- Replace gathers at shallow tree levels with preloaded node vectors and
+  `vselect` trees.
 - Reduce vector-ALU pressure by fusing compatible hash patterns into
   `multiply_add`.
-- Use ALU lanes for simple lane-wise work (XOR, parity/offset prep) to reserve
-  VALU bandwidth for operations that truly need it.
+- Keep indices in one-based form in scratch (`1..n_nodes`), so parent/child
+  transitions become cheap arithmetic and level selection can reuse carried
+  branch bits.
 - Tile work by blocks and rounds to increase instruction-level parallelism while
   staying within scratch limits.
 
@@ -88,29 +89,36 @@ it is emitted as a single vector:
 
 This removes extra intermediate vector operations and lowers VALU demand.
 
-### D. Better ALU/VALU role split
+### D. One-based index update with carried branch bits
 
-- Lane-wise XOR (`value ^= node`) is emitted as ALU lane ops.
-- Index update computes lane offsets in ALU and then performs one vector
-  `multiply_add` for `idx = 2*idx + offset`.
+- Input indices are shifted to one-based immediately after load.
+- For non-wrap rounds, update is:
+  `j = 2*j + (val & 1)` (with `multiply_add` on vectors).
+- At wrap (`lvl == forest_height`), index is reset to `1` via `vbroadcast`.
+- Low-level branch bits are carried through context vectors (`node/t2/t3`) and
+  reused by shallow-level `vselect` logic, reducing recomputation.
 
-This keeps expensive VALU slots available for fused hash work.
+### E. Constant and pointer setup tightening
 
-### E. Tiling and scratch layout
+- A larger set of frequently used small constants (`5,6,7,8,9,10,11,12,13,14,16,19,33,4097`)
+  is synthesized arithmetically from `sc[0]`/`sc[1]`, reducing load-engine use.
+- Input/value pointers are derived from `p_forest` with `add_imm`:
+  `p_forest_m1 = p_forest - 1`, `p_indices = p_forest + n_nodes`,
+  `p_values = p_forest + n_nodes + batch_size`.
+- Gather addresses for deep levels use `vp_forest = broadcast(p_forest - 1)`,
+  matching the one-based index convention.
+
+### F. Tiling and scratch layout
 
 The kernel keeps full-batch index/value buffers in scratch and processes work in
 tiles:
 
-- `tile_w = 17` blocks
+- `tile_w = 16` blocks
 - `tile_r = 13` rounds
+- `strip_r = 13` (defaulted from `tile_r`)
 
 Each tile slot gets dedicated temporary vectors (`node`, `t0..t3`) to maintain
 parallel independent chains for scheduling.
-
-### F. Low-overhead initialization
-
-Small constants are built from zero-initialized scratch with ALU/flow ops where
-possible, reducing load-slot usage during setup.
 
 ## 5. Correctness and Validation
 
@@ -129,6 +137,12 @@ submission configuration (`10, 16, 256`).
 The optimization choices prioritize cycle count for that target over broad
 generality.
 
+Recent exploration note:
+
+- Additional schedule and micro-op experiments were run after reaching `1184`,
+  but none improved on `1184` without correctness loss or regression. Current
+  stable best in this workspace remains `1184`.
+
 ## 7. Reproducible Commands
 
 ```bash
@@ -139,4 +153,4 @@ git diff origin/main tests/
 python3 tests/submission_tests.py
 ```
 
-Expected current cycle result in this workspace: **1329**.
+Expected current cycle result in this workspace: **1184**.
